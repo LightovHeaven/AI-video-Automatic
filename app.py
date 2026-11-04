@@ -41,8 +41,37 @@ def load_whisper_model():
     """Tải và lưu trữ model Whisper Base trên RAM"""
     return whisper.load_model("base")
 
+def extract_audio_to_wav(video_path: str, wav_path: str) -> bool:
+    """
+    Trích xuất âm thanh từ video sang định dạng chuẩn 16kHz Mono WAV cho Whisper.
+    Trả về True nếu thành công, False nếu video không có audio stream hoặc trích xuất thất bại.
+    """
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", video_path,
+        "-vn",
+        "-acodec", "pcm_s16le",
+        "-ar", "16000",
+        "-ac", "1",
+        wav_path
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        # Kiểm tra return code và kích thước file sau khi xuất
+        if result.returncode != 0 or not os.path.exists(wav_path) or os.path.getsize(wav_path) == 0:
+            return False
+        return True
+    except Exception:
+        return False
+
 def generate_cashflow_script(property_data: dict, openai_key: str = "") -> str:
-    """Tạo kịch bản bán BĐS dòng tiền (Sử dụng OpenAI API nếu có key, hoặc Template Engine nâng cao)"""
+    """Tạo kịch bản bán BĐS dòng tiền (Sử dụng OpenAI API nếu có, fallback về template nội bộ)"""
     title = property_data.get("title", "")
     location = property_data.get("location", "")
     area = property_data.get("area", "")
@@ -55,15 +84,14 @@ def generate_cashflow_script(property_data: dict, openai_key: str = "") -> str:
             from openai import OpenAI
             client = OpenAI(api_key=openai_key.strip())
             prompt = f"""
-            Bạn là chuyên gia marketing bất động sản dòng tiền của kênh 'Hậu Dòng Tiền Real Estate'.
-            Hãy viết một kịch bản video ngắn (khoảng 60-90 từ) với phong cách cuốn hút, thực chiến, tập trung vào yếu tố DÒNG TIỀN và GIÁ TRỊ LÃI KÉP:
+            Bạn là chuyên gia marketing kênh 'Hậu Dòng Tiền Real Estate'.
+            Hãy viết kịch bản video ngắn (60-90 từ) dứt khoát, thuyết phục, tập trung vào DÒNG TIỀN và LÃI KÉP:
             - Loại hình/Tên: {title}
             - Vị trí: {location}
             - Diện tích/Quy mô: {area}
             - Giá bán: {price}
             - Dòng tiền khai thác: {cashflow}
             - Lợi thế/Điểm nổi bật: {highlight}
-            Yêu cầu: Mở đầu bằng một câu Hook giật tít về dòng tiền, thân bài dứt khoát số liệu, kết bài kêu gọi liên hệ Hậu Dòng Tiền.
             """
             response = client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -73,24 +101,22 @@ def generate_cashflow_script(property_data: dict, openai_key: str = "") -> str:
             )
             return response.choices[0].message.content.strip()
         except Exception:
-            pass # Tự động fallback về template engine nếu lỗi API
+            pass
 
-    # Template Engine chuyên sâu cho Bất Động Sản Dòng Tiền
-    script = (
+    return (
         f"Cơ hội sở hữu cỗ máy in tiền thụ động ngay tại {location}! "
         f"Chào mừng quý nhà đầu tư đến với {title}, quy mô {area}. "
         f"Tài sản đang tạo ra dòng tiền cho thuê đều đặn {cashflow}, đạt tỷ suất sinh lời vượt trội so với gửi ngân hàng. "
         f"Đặc biệt: {highlight}. Giá sang nhượng trọn gói chỉ {price}. "
         f"Liên hệ ngay Hậu Dòng Tiền để nhận bảng phân tích tài chính chi tiết từng tháng!"
     )
-    return script
 
 def process_video_ffmpeg(video_in: str, srt_in: str, logo_in: str, video_out: str):
     """
-    Xử lý FFmpeg nâng cao:
-    - Scale Logo phù hợp (chiều ngang 170px) và overlay góc trên bên phải.
-    - Nung cứng (hardsub) phụ đề với font chữ viền đen rõ nét.
-    - Giữ nguyên luồng âm thanh gốc (-map 0:a?).
+    Sử dụng FFmpeg để:
+    1. Scale logo bản quyền và đóng dấu watermark góc trên bên phải.
+    2. Nung cứng (hardsub) phụ đề với viền đen tương phản cao.
+    3. Giữ nguyên luồng âm thanh gốc của video.
     """
     escaped_srt = srt_in.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
     subtitle_style = (
@@ -103,14 +129,10 @@ def process_video_ffmpeg(video_in: str, srt_in: str, logo_in: str, video_out: st
 
     if logo_in and os.path.exists(logo_in):
         cmd.extend(["-i", logo_in])
-        # Scale logo chiều rộng về 170px để tránh che khuất màn hình
         filter_steps.append("[1:v]scale=170:-1[logo]")
-        # Đóng dấu watermark góc trên bên phải: cách lề phải 25px, lề trên 25px
         filter_steps.append("[0:v][logo]overlay=W-w-25:25[vlogo]")
-        # Ép phụ đề lên luồng video đã có watermark
         filter_steps.append(f"[vlogo]subtitles='{escaped_srt}':force_style='{subtitle_style}'[vout]")
     else:
-        # Nếu không có logo, chỉ hardsub trực tiếp
         filter_steps.append(f"[0:v]subtitles='{escaped_srt}':force_style='{subtitle_style}'[vout]")
 
     cmd.extend([
@@ -131,26 +153,25 @@ def process_video_ffmpeg(video_in: str, srt_in: str, logo_in: str, video_out: st
         raise RuntimeError(f"Lỗi FFmpeg: {result.stderr}")
 
 # ==========================================
-# GIAO DIỆN NGƯỜI DÙNG (STREAMLIT)
+# GIAO DIỆN NGƯỜI DÙNG (STREAMLIT UI)
 # ==========================================
 def main():
     st.markdown("<h2 style='text-align: center; color: #1E3A8A;'>🏢 HẬU DÒNG TIỀN REAL ESTATE</h2>", unsafe_allow_html=True)
-    st.markdown("<p style='text-align: center;'>Hệ thống sản xuất video BĐS tự động hóa: Tạo Kịch Bản AI - Bóc Tách Phụ Đề - Đóng Dấu Bản Quyền</p>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align: center;'>Hệ thống sản xuất video BĐS tự động: Kịch Bản AI - Trích Xuất Phụ Đề Chuẩn Xác - Đóng Dấu Bản Quyền</p>", unsafe_allow_html=True)
     st.divider()
 
     with st.sidebar:
-        st.header("⚙️ Cấu hình nâng cao")
+        st.header("⚙️ Cấu hình")
         openai_key = st.text_input(
-            "OpenAI API Key (Không bắt buộc):",
+            "OpenAI API Key (Tùy chọn):",
             type="password",
-            help="Nhập key nếu muốn kịch bản biến hóa đa dạng hơn bằng GPT-4o-mini. Để trống sẽ dùng Template Engine mặc định."
+            help="Để trống sẽ dùng kịch bản mẫu tối ưu sẵn cho BĐS dòng tiền."
         )
-        st.info("💡 **Gợi ý**: Video xuất bản sẽ tự động đồng bộ phụ đề gốc và chèn watermark bản quyền nhận diện thương hiệu.")
 
     col1, col2 = st.columns([1.1, 0.9], gap="large")
 
     with col1:
-        st.subheader("1. Thông tin BĐS khai thác dòng tiền")
+        st.subheader("1. Thông tin BĐS")
         c1, c2 = st.columns(2)
         with c1:
             prop_title = st.text_input("Loại hình / Tiêu đề:", value="Tòa Căn Hộ Dịch Vụ 7 Tầng Thang Máy")
@@ -161,36 +182,38 @@ def main():
             prop_cashflow = st.text_input("Dòng tiền khai thác / tháng:", value="85 Triệu/tháng (Dòng tiền ròng ~6.5%/năm)")
             prop_highlight = st.text_input("Lợi thế cạnh tranh:", value="PCCC chuẩn chỉ, full nội thất, luôn kín phòng")
 
-        st.subheader("2. Tư liệu Media")
+        st.subheader("2. Dữ liệu Video & Logo")
         uploaded_video = st.file_uploader(
-            "Tải lên video thực tế BĐS (.mp4, .mov):",
+            "Tải lên video thực tế BĐS có tiếng nói (.mp4, .mov):",
             type=["mp4", "mov"],
-            help="Video quay thực tế không gian nhà, phòng cho thuê hoặc mặt tiền."
+            help="Video quay kèm giọng đọc thuyết minh thực tế của bạn."
         )
         uploaded_logo = st.file_uploader(
             "Tải lên Logo bản quyền (.png trong suốt):",
             type=["png"],
-            help="Logo thương hiệu 'Hậu Dòng Tiền' nền trong suốt để đóng dấu watermark."
+            help="Logo thương hiệu để đóng dấu watermark."
         )
 
-        generate_btn = st.button("🚀 Sản xuất Video Bất Động Sản Hoàn Chỉnh", type="primary", use_container_width=True)
+        submit_btn = st.button("🚀 Sản xuất Video Bất Động Sản Hoàn Chỉnh", type="primary", use_container_width=True)
 
     with col2:
         st.subheader("3. Màn hình sản xuất & Thành phẩm")
         output_area = st.container()
 
-    if generate_btn:
+    if submit_btn:
         if uploaded_video is None:
             st.error("⚠️ Vui lòng tải lên file video gốc (.mp4 hoặc .mov)!")
             return
 
         temp_files = []
+        has_error = False
+
         try:
             with output_area:
-                status_box = st.status("Đang chuẩn bị dữ liệu...", expanded=True)
+                status_box = st.status("Đang chuẩn bị tiến trình...", expanded=True)
 
-                # Bước 1: Sinh kịch bản BĐS dòng tiền
-                status_box.write("📝 **Bước 1/3**: Khởi tạo kịch bản bán BĐS dòng tiền...")
+                # Bước 1: Tạo kịch bản BĐS
+                status_box.write("📝 **Bước 1/4**: Khởi tạo kịch bản BĐS dòng tiền...")
                 prop_data = {
                     "title": prop_title,
                     "location": prop_location,
@@ -200,30 +223,45 @@ def main():
                     "highlight": prop_highlight
                 }
                 ai_script = generate_cashflow_script(prop_data, openai_key)
-                st.markdown("**📋 Kịch bản gợi ý cho BĐS:**")
+                st.markdown("**📋 Kịch bản phân tích tài chính:**")
                 st.info(ai_script)
 
-                # Lưu video gốc vào file tạm
-                status_box.write("📥 Đang nạp video đầu vào...")
+                # Lưu video gốc
+                status_box.write("📥 Đang lưu trữ file video tải lên...")
                 vid_suffix = os.path.splitext(uploaded_video.name)[1]
                 with tempfile.NamedTemporaryFile(delete=False, suffix=vid_suffix) as tmp_vid:
                     tmp_vid.write(uploaded_video.read())
                     raw_video_path = tmp_vid.name
                 temp_files.append(raw_video_path)
 
-                # Lưu logo vào file tạm (nếu có)
+                # Lưu logo (nếu có)
                 logo_path = ""
                 if uploaded_logo is not None:
-                    status_box.write("🖼️ Đang nạp logo watermark...")
                     with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp_logo:
                         tmp_logo.write(uploaded_logo.read())
                         logo_path = tmp_logo.name
                     temp_files.append(logo_path)
 
-                # Bước 2: Bóc tách phụ đề bằng Whisper
-                status_box.write("🎙️ **Bước 2/3**: Whisper đang bóc tách âm thanh sang phụ đề tiếng Việt...")
+                # Bước 2: Tách Audio sang file WAV riêng biệt
+                status_box.write("🎵 **Bước 2/4**: Đang trích xuất luồng âm thanh sang định dạng chuẩn WAV...")
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_wav:
+                    wav_path = tmp_wav.name
+                temp_files.append(wav_path)
+
+                audio_extracted = extract_audio_to_wav(raw_video_path, wav_path)
+
+                # Xử lý trường hợp video không có tiếng hoặc lỗi luồng âm thanh
+                if not audio_extracted:
+                    status_box.update(label="⚠️ Không thể đọc âm thanh!", state="error", expanded=False)
+                    st.warning("Video này không có âm thanh hoặc luồng tiếng bị lỗi, vui lòng kiểm tra lại file video!")
+                    has_error = True
+                    return
+
+                # Bước 3: Whisper nhận trực tiếp file WAV
+                status_box.write("🎙️ **Bước 3/4**: Whisper đang bóc tách phụ đề từ file âm thanh WAV...")
                 whisper_model = load_whisper_model()
-                transcribe_res = whisper_model.transcribe(raw_video_path, language="vi", task="transcribe")
+                # TUYỆT ĐỐI KHÔNG truyền file video vào đây, truyền trực tiếp wav_path đã chuẩn hóa
+                transcribe_res = whisper_model.transcribe(wav_path, language="vi", task="transcribe")
 
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".srt") as tmp_srt:
                     srt_path = tmp_srt.name
@@ -231,8 +269,8 @@ def main():
 
                 write_srt_file(transcribe_res.get("segments", []), srt_path)
 
-                # Bước 3: FFmpeg Overlay Logo & Hardsub
-                status_box.write("⚡ **Bước 3/3**: FFmpeg đang đóng dấu watermark & nung phụ đề...")
+                # Bước 4: FFmpeg đóng dấu Watermark & Nung phụ đề
+                status_box.write("⚡ **Bước 4/4**: FFmpeg đang đóng dấu watermark & nung phụ đề lên video...")
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_out:
                     final_video_path = tmp_out.name
                 temp_files.append(final_video_path)
@@ -246,10 +284,9 @@ def main():
 
                 status_box.update(label="🎉 Sản xuất video hoàn tất!", state="complete", expanded=False)
 
-                # Hiển thị video thành phẩm
+                # Hiển thị và tải video
                 st.video(final_video_path)
 
-                # Đọc byte và tạo nút tải về
                 with open(final_video_path, "rb") as f:
                     final_video_bytes = f.read()
 
@@ -262,9 +299,10 @@ def main():
                 )
 
         except Exception as e:
-            st.error(f"❌ Xảy ra lỗi trong quá trình xử lý: {str(e)}")
+            if not has_error:
+                st.error(f"❌ Xảy ra lỗi trong quá trình xử lý: {str(e)}")
         finally:
-            # Thu hồi toàn bộ tài nguyên file tạm
+            # Dọn dẹp tài nguyên file tạm
             for path in temp_files:
                 if os.path.exists(path):
                     try:
