@@ -1,4 +1,6 @@
-streamlit
+streamlit>=1.30.0
 openai-whisper
+edge-tts>=6.1.9
+nest-asyncio>=1.6.0
 torch
-numpy
+torchaudio
