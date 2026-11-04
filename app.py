@@ -1,10 +1,11 @@
 import streamlit as st
 import os
 import tempfile
+import subprocess
 import whisper
 
 # -----------------------------------------------------------------------------
-# CẤU HÌNH GIAO DIỆN STREAMLIT
+# CẤU HÌNH GIAO DIỆN
 # -----------------------------------------------------------------------------
 st.set_page_config(
     page_title="AI Video Subtitle - Hậu Dòng Tiền Real Estate",
@@ -13,18 +14,35 @@ st.set_page_config(
 )
 
 # -----------------------------------------------------------------------------
-# HÀM BỔ TRỢ & CACHE MODEL
+# CÁC HÀM XỬ LÝ ÂM THANH & MÔ HÌNH
 # -----------------------------------------------------------------------------
-@st.cache_resource(show_spinner="Đang khởi tạo mô hình Whisper AI...")
+@st.cache_resource(show_spinner="Đang nạp mô hình Whisper AI...")
 def load_whisper_model(model_name="base"):
-    """
-    Tải và cache mô hình Whisper vào bộ nhớ RAM.
-    Giúp tránh việc phải tải lại model mỗi lần người dùng bấm nút.
-    """
     return whisper.load_model(model_name)
 
+def extract_audio_ffmpeg(input_path: str, output_wav_path: str):
+    """
+    Sử dụng subprocess để gọi FFmpeg trực tiếp, trích xuất âm thanh thành file .wav chuẩn.
+    Tránh hoàn toàn lỗi 'Output file does not contain any stream' của FFmpeg 7.x trên Whisper.
+    """
+    command = [
+        "ffmpeg",
+        "-y",               # Ghi đè file nếu đã tồn tại
+        "-i", input_path,   # File video/audio đầu vào
+        "-vn",              # Tắt stream hình ảnh (chỉ lấy âm thanh)
+        "-acodec", "pcm_s16le", # Codec 16-bit PCM
+        "-ar", "16000",     # Tần số lấy mẫu 16kHz chuẩn của Whisper
+        "-ac", "1",         # Kênh âm thanh Mono (1 kênh)
+        output_wav_path
+    ]
+    
+    # Thực thi lệnh và bắt lỗi nếu FFmpeg thất bại
+    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"FFmpeg gặp lỗi khi trích xuất âm thanh:\n{result.stderr}")
+
 def format_time_srt(seconds: float) -> str:
-    """Chuyển đổi số giây sang định dạng chuẩn SRT (HH:MM:SS,mmm)."""
+    """Đổi số giây sang định dạng SRT chuẩn (HH:MM:SS,mmm)."""
     hrs = int(seconds // 3600)
     mins = int((seconds % 3600) // 60)
     secs = int(seconds % 60)
@@ -32,7 +50,7 @@ def format_time_srt(seconds: float) -> str:
     return f"{hrs:02d}:{mins:02d}:{secs:02d},{ms:03d}"
 
 def generate_srt_content(segments: list) -> str:
-    """Tạo chuỗi nội dung file .srt trực tiếp trên RAM, không cần ghi đè file rác."""
+    """Tạo chuỗi phụ đề SRT trong bộ nhớ RAM."""
     srt_lines = []
     for i, seg in enumerate(segments, start=1):
         start_str = format_time_srt(seg["start"])
@@ -44,62 +62,66 @@ def generate_srt_content(segments: list) -> str:
 # -----------------------------------------------------------------------------
 # GIAO DIỆN CHÍNH (UI)
 # -----------------------------------------------------------------------------
-st.title("🎬 Ứng Dụng AI Tự Động Bóc Tách Phụ Đề Video")
+st.title("🎬 Ứng Dụng AI Tự Động Tạo Subtitle")
 st.markdown("### Thương hiệu: **Hậu Dòng Tiền Real Estate** 🏢")
-st.caption("Công cụ hỗ trợ bóc tách âm thanh, nhận diện tiếng Việt và xuất file phụ đề chuẩn xác.")
+st.caption("Công cụ trích xuất và bóc tách phụ đề tiếng Việt tự động cho video Bất Động Sản.")
 
-# Tùy chọn mô hình
 with st.expander("⚙️ Tùy chọn cấu hình AI", expanded=False):
     model_choice = st.selectbox(
-        "Chọn kích thước mô hình (Mặc định 'base' là tối ưu nhất cho Streamlit Cloud):",
+        "Kích thước mô hình Whisper:",
         options=["tiny", "base", "small"],
         index=1,
-        help="'tiny' nhanh nhất nhưng kém chính xác; 'base' cân bằng tốt; 'small' chính xác hơn nhưng tốn RAM hơn."
+        help="'base' chạy ổn định và vừa vặn nhất với bộ nhớ RAM miễn phí của Streamlit Cloud."
     )
 
 uploaded_file = st.file_uploader(
-    "Chọn file video của anh (.mp4, .mov, .mkv, .mp3):", 
+    "Chọn file video hoặc audio của anh (.mp4, .mov, .mkv, .mp3, .m4a):", 
     type=["mp4", "mov", "mkv", "mp3", "m4a"]
 )
 
 if uploaded_file is not None:
-    st.success(f"Đã nhận file: **{uploaded_file.name}** ({uploaded_file.size / (1024 * 1024):.2f} MB)")
+    st.success(f"Đã tải lên: **{uploaded_file.name}** ({uploaded_file.size / (1024 * 1024):.2f} MB)")
     
-    # Hiển thị video preview
     if uploaded_file.type.startswith("video"):
         st.video(uploaded_file)
-    elif uploaded_file.type.startswith("audio"):
+    else:
         st.audio(uploaded_file)
     
     if st.button("🚀 Bắt đầu nhận diện & Tạo Sub", type="primary"):
-        # Lấy đuôi file mở rộng thực tế
         suffix = os.path.splitext(uploaded_file.name)[-1].lower() or ".mp4"
         
-        temp_video_path = None
+        temp_input_path = None
+        temp_wav_path = None
+        
         try:
-            # 1. Lưu file tạm và đóng stream (BẮT BUỘC ĐỂ KHẮC PHỤC LỖI FFMPEG)
-            with st.spinner("Đang lưu trữ dữ liệu tạm thời..."):
-                tfile = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-                tfile.write(uploaded_file.read())
-                temp_video_path = tfile.name
-                tfile.flush()
-                tfile.close()  # <-- Đóng file để nhường quyền truy cập cho FFmpeg
+            # 1. Ghi file tải lên vào file tạm
+            with st.spinner("Đang lưu trữ dữ liệu..."):
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tfile:
+                    tfile.write(uploaded_file.read())
+                    temp_input_path = tfile.name
 
-            # 2. Chạy mô hình Whisper
-            with st.spinner(f"AI Whisper ({model_choice}) đang nghe và bóc tách tiếng Việt... Vui lòng đợi trong giây lát."):
+            # 2. Tạo đường dẫn file WAV tạm
+            temp_wav_path = temp_input_path + ".converted.wav"
+
+            # 3. Trích xuất âm thanh bằng Subprocess FFmpeg (Fix triệt để lỗi FFmpeg v7.x)
+            with st.spinner("Đang trích xuất kênh âm thanh chuẩn (16kHz Mono)..."):
+                extract_audio_ffmpeg(temp_input_path, temp_wav_path)
+
+            # 4. Chạy mô hình Whisper nhận diện giọng nói
+            with st.spinner(f"AI Whisper ({model_choice}) đang nghe và bóc tách tiếng Việt..."):
                 model = load_whisper_model(model_choice)
                 
-                # Chạy bóc tách âm thanh
+                # Truyền trực tiếp đường dẫn file WAV đã chuẩn hóa
                 result = model.transcribe(
-                    temp_video_path,
+                    temp_wav_path,
                     language="vi",
-                    fp16=False,            # Tắt fp16 vì Streamlit Cloud chạy CPU
+                    fp16=False,
                     verbose=False
                 )
 
             st.success("🎉 Đã tạo phụ đề thành công!")
 
-            # 3. Tạo nội dung file SRT & nút tải về
+            # 5. Xuất file SRT & Nút tải về
             srt_content = generate_srt_content(result.get("segments", []))
             base_filename = os.path.splitext(uploaded_file.name)[0]
             
@@ -111,15 +133,14 @@ if uploaded_file is not None:
                 type="primary"
             )
 
-            # 4. Hiển thị nội dung phụ đề trực quan
-            st.markdown("#### 📜 Danh sách đoạn hội thoại đã nhận diện:")
+            # 6. Hiển thị nội dung phụ đề lên giao diện
+            st.markdown("#### 📜 Danh sách câu thoại đã nhận diện:")
             segments = result.get("segments", [])
             
             if not segments:
-                st.warning("Không tìm thấy đoạn hội thoại nào trong video/audio.")
+                st.warning("Không nhận diện được giọng nói trong video.")
             else:
-                sub_container = st.container(height=320)
-                with sub_container:
+                with st.container(height=320):
                     for seg in segments:
                         start_time = format_time_srt(seg['start'])
                         end_time = format_time_srt(seg['end'])
@@ -127,13 +148,13 @@ if uploaded_file is not None:
                         st.markdown(f"⏱️ **`{start_time} --> {end_time}`** : {text}")
 
         except Exception as e:
-            st.error(f"❌ Đã xảy ra lỗi trong quá trình xử lý: {str(e)}")
-            st.info("💡 Mẹo: Nếu video quá dài hoặc dung lượng lớn, hãy nén nhẹ video trước khi tải lên.")
+            st.error(f"❌ Xảy ra lỗi: {str(e)}")
 
         finally:
-            # Dọn dẹp file tạm trên server để tránh đầy bộ nhớ
-            if temp_video_path and os.path.exists(temp_video_path):
-                try:
-                    os.remove(temp_video_path)
-                except Exception:
-                    pass
+            # Dọn dẹp cả 2 file tạm để giải phóng bộ nhớ server
+            for p in [temp_input_path, temp_wav_path]:
+                if p and os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
