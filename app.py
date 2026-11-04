@@ -1,101 +1,225 @@
-import streamlit as st
 import os
+import sys
+import asyncio
 import tempfile
 import subprocess
+from datetime import timedelta
+import streamlit as st
 import whisper
 
-st.set_page_config(page_title="AI Video Automatic - Hậu Dòng Tiền", page_icon="🎬")
+# ==========================================
+# CẤU HÌNH GIAO DIỆN STREAMLIT
+# ==========================================
+st.set_page_config(
+    page_title="Hệ Thống Tự Động Hóa Video Bất Động Sản",
+    page_icon="🏡",
+    layout="wide"
+)
 
-st.title("🎬 Ứng Dụng AI Tự Động Xử Lý Video Bất Động Sản")
-st.markdown("### Thương hiệu: **Hậu Dòng Tiền Real Estate**")
-st.write("Tải video thô lên đây, hệ thống sẽ tự động tạo phụ đề tiếng Việt chuẩn xác cho anh!")
+# ==========================================
+# HÀM BỔ TRỢ (UTILITIES)
+# ==========================================
+def format_srt_time(seconds: float) -> str:
+    """Chuyển đổi giây thành định dạng thời gian chuẩn SRT: HH:MM:SS,mmm"""
+    td = timedelta(seconds=seconds)
+    total_seconds = int(td.total_seconds())
+    millis = int((seconds - int(seconds)) * 1000)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
-uploaded_file = st.file_uploader("Chọn file video thô của anh (.mp4, .mov):", type=["mp4", "mov"])
+def write_srt(segments: list, srt_filepath: str):
+    """Xuất danh sách segment của Whisper ra file định dạng .srt"""
+    with open(srt_filepath, "w", encoding="utf-8") as f:
+        for idx, seg in enumerate(segments, start=1):
+            start_str = format_srt_time(seg["start"])
+            end_str = format_srt_time(seg["end"])
+            text = seg["text"].strip()
+            f.write(f"{idx}\n{start_str} --> {end_str}\n{text}\n\n")
 
-def extract_audio_to_wav(video_path, output_wav_path):
+@st.cache_resource
+def load_whisper_model():
+    """Tải và lưu trữ model Whisper trong cache RAM để tránh tải lại mỗi lần click"""
+    return whisper.load_model("base")
+
+async def _edge_tts_runner(text: str, voice: str, output_path: str):
+    import edge_tts
+    communicate = edge_tts.Communicate(text=text, voice=voice)
+    await communicate.save(output_path)
+
+def generate_voiceover(text: str, voice: str, output_path: str):
+    """Bọc tác vụ async của edge-tts để chạy an toàn trên luồng của Streamlit"""
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    if loop.is_running():
+        # Phòng ngừa trường hợp Streamlit chạy trên event loop lồng nhau
+        import nest_asyncio
+        nest_asyncio.apply()
+        loop.run_until_complete(_edge_tts_runner(text, voice, output_path))
+    else:
+        loop.run_until_complete(_edge_tts_runner(text, voice, output_path))
+
+def burn_subtitles_and_mux_audio(video_in: str, audio_in: str, srt_in: str, video_out: str):
     """
-    Trích xuất âm thanh từ video sang file wav bằng subprocess với các tham số chuẩn chống lỗi FFmpeg v7.x
+    Sử dụng FFmpeg để:
+    1. Nung cứng (hardsub) phụ đề với style rõ nét cho video BĐS.
+    2. Thay thế luồng âm thanh gốc bằng giọng đọc AI mới.
+    3. Cắt độ dài video bằng độ dài âm thanh (-shortest).
     """
-    command = [
+    # Xử lý escape ký tự đặc biệt cho FFmpeg filter path (đặc biệt là dấu ':' và '\')
+    escaped_srt = srt_in.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+    
+    # Định dạng style phụ đề: Chữ trắng, viền đen dày, kích cỡ dễ đọc trên điện thoại
+    style = "FontName=Arial,FontSize=18,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=3,Outline=2,MarginV=40,Bold=1"
+    subtitles_filter = f"subtitles='{escaped_srt}':force_style='{style}'"
+
+    cmd = [
         "ffmpeg",
-        "-y",                   # Ghi đè file nếu đã tồn tại
-        "-i", video_path,       # File video đầu vào
-        "-vn",                  # Bỏ qua phần hình ảnh
-        "-acodec", "pcm_s16le", # Mã hóa âm thanh chuẩn 16-bit PCM
-        "-ar", "16000",         # Tần số lấy mẫu 16kHz (phù hợp cho Whisper)
-        "-ac", "1",             # Chuyển thành âm thanh đơn kênh (Mono)
-        output_wav_path         # File wav đầu ra
+        "-y",
+        "-i", video_in,
+        "-i", audio_in,
+        "-filter_complex", f"[0:v]{subtitles_filter}[v]",
+        "-map", "[v]",
+        "-map", "1:a:0",
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "22",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-shortest",
+        video_out
     ]
-    
-    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0:
-        error_message = result.stderr.decode('utf-8', errors='ignore')
-        raise RuntimeError(f"FFmpeg gặp lỗi khi trích xuất âm thanh: {error_message}")
-    
-    return output_wav_path
+        raise RuntimeError(f"Lỗi FFmpeg: {result.stderr}")
 
-if uploaded_file is not None:
-    st.success("Đã tải video lên thành công!")
-    st.video(uploaded_file)
-    
-    if st.button("🚀 Bắt đầu để AI xử lý và tạo Sub"):
-        with st.spinner("AI Whisper đang nghe audio và tạo phụ đề (quá trình này mất khoảng 1-2 phút)..."):
-            # 1. Lưu tạm video vào thư mục của server
-            tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
-            tfile.write(uploaded_file.read())
-            tfile.close()  
-            video_path = tfile.name
+# ==========================================
+# GIAO DIỆN NGƯỜI DÙNG (STREAMLIT UI)
+# ==========================================
+def main():
+    st.title("🏡 Hệ Thống Tự Động Hóa Video Bất Động Sản")
+    st.markdown("Quy trình khép kín: **Tạo Giọng Đọc AI ➔ Bóc Tách Phụ Đề ➔ Ghép Hardsub & Âm Thanh**.")
 
-            wav_path = video_path + ".wav"
+    col1, col2 = st.columns([1, 1], gap="large")
 
-            try:
-                # 2. Trích xuất sang wav an toàn
-                extract_audio_to_wav(video_path, wav_path)
-                
-                # 3. Tải mô hình AI Whisper và dịch
-                model = whisper.load_model("base")
-                result = model.transcribe(wav_path, language="vi")
-                
-                st.success("🎉 Đã tạo phụ đề thành công!")
-                
-                st.markdown("#### 📜 Nội dung phụ đề AI vừa nhận diện:")
-                for segment in result["segments"]:
-                    start = segment['start']
-                    end = segment['end']
-                    text = segment['text'].strip() if hasattr(segment['text'], 'strip') else str(segment['text']).strip()
-                    st.text(f"[{start:.1f}s --> {end:.1f}s]: {text}")
-                    
-                # 4. Tạo file srt để tải về
-                srt_filename = "subtitles.srt"
-                with open(srt_filename, "w", encoding="utf-8") as f:
-                    for i, segment in enumerate(result["segments"], start=1):
-                        s = segment["start"]
-                        e = segment["end"]
-                        t = segment["text"].strip()
-                        
-                        def format_time(seconds):
-                            hrs = int(seconds // 3600)
-                            mins = int((seconds % 3600) // 60)
-                            secs = int(seconds % 60)
-                            ms = int((seconds - int(seconds)) * 1000)
-                            return f"{hrs:02d}:{mins:02d}:{secs:02d},{ms:03d}"
-                        
-                        f.write(f"{i}\n{format_time(s)} --> {format_time(e)}\n{t}\n\n")
-                
-                with open(srt_filename, "rb") as f:
-                    st.download_button(
-                        label="📥 Tải xuống file phụ đề (.srt)",
-                        data=f,
-                        file_name="subtitles.srt",
-                        mime="text/plain"
-                    )
+    with col1:
+        st.subheader("1. Tải lên tư liệu")
+        uploaded_video = st.file_uploader(
+            "Chọn video quay nhà đất thô (.mp4, .mov):",
+            type=["mp4", "mov"],
+            help="Tải lên video thực tế không gian nhà đất của bạn."
+        )
 
-            except Exception as e:
-                st.error(f"Đã xảy ra lỗi trong quá trình xử lý: {e}")
+        voice_choice = st.selectbox(
+            "Chọn giọng đọc AI:",
+            options=[
+                ("vi-VN-HoaiMyNeural", "Hoài My (Nữ - Truyền cảm, miền Nam)"),
+                ("vi-VN-NamMinhNeural", "Nam Minh (Nam - Chuyên nghiệp, miền Bắc)")
+            ],
+            format_func=lambda x: x[1]
+        )
 
-            finally:
-                # Dọn dẹp file tạm trên server
-                if os.path.exists(video_path):
-                    os.remove(video_path)
-                if os.path.exists(wav_path):
-                    os.remove(wav_path)
+        script_text = st.text_area(
+            "2. Nhập kịch bản giới thiệu nhà đất (Script):",
+            height=200,
+            placeholder="Ví dụ: Chào mừng quý anh chị đã đến với căn biệt thự đơn lập tọa lạc tại khu đô thị sinh thái xanh..."
+        )
+
+        submit_btn = st.button("🚀 Sản xuất video tự động", use_container_width=True, type="primary")
+
+    with col2:
+        st.subheader("3. Trạng thái & Kết quả")
+        result_container = st.container()
+
+    if submit_btn:
+        # Kiểm tra điều kiện đầu vào
+        if uploaded_video is None:
+            st.error("⚠️ Vui lòng tải lên file video gốc!")
+            return
+        if not script_text.strip():
+            st.error("⚠️ Kịch bản đọc (Text Script) không được để trống!")
+            return
+
+        temp_files = []
+        try:
+            with result_container:
+                status = st.status("Đang khởi động tiến trình xử lý...", expanded=True)
+
+                # Lưu video gốc tải lên
+                status.write("📥 Đang lưu trữ file video tải lên...")
+                suffix = os.path.splitext(uploaded_video.name)[1]
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as raw_video_tmp:
+                    raw_video_tmp.write(uploaded_video.read())
+                    raw_video_path = raw_video_tmp.name
+                temp_files.append(raw_video_path)
+
+                # Bước 1: Tạo Voiceover TTS
+                status.write("🎙️ Bước 1: Đang tạo giọng đọc AI từ văn bản...")
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as voice_tmp:
+                    voice_path = voice_tmp.name
+                temp_files.append(voice_path)
+
+                generate_voiceover(
+                    text=script_text.strip(),
+                    voice=voice_choice[0],
+                    output_path=voice_path
+                )
+
+                # Bước 2: Bóc tách phụ đề bằng Whisper
+                status.write("🧠 Bước 2: Whisper đang phân tích âm thanh & tạo file phụ đề (.srt)...")
+                model = load_whisper_model()
+                transcribe_result = model.transcribe(voice_path, language="vi", task="transcribe")
+
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".srt") as srt_tmp:
+                    srt_path = srt_tmp.name
+                temp_files.append(srt_path)
+
+                write_srt(transcribe_result["segments"], srt_path)
+
+                # Bước 3: Ghép video, nung phụ đề và hợp nhất âm thanh bằng FFmpeg
+                status.write("⚡ Bước 3: FFmpeg đang xử lý render video (Hardsub & Ghép âm thanh)...")
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as out_video_tmp:
+                    out_video_path = out_video_tmp.name
+                temp_files.append(out_video_path)
+
+                burn_subtitles_and_mux_audio(
+                    video_in=raw_video_path,
+                    audio_in=voice_path,
+                    srt_in=srt_path,
+                    video_out=out_video_path
+                )
+
+                status.update(label="✅ Sản xuất video thành công!", state="complete", expanded=False)
+
+                # Bước 4: Hiển thị video hoàn thiện & Nút tải về
+                st.video(out_video_path)
+
+                with open(out_video_path, "rb") as f:
+                    final_bytes = f.read()
+
+                st.download_button(
+                    label="💾 Tải video hoàn chỉnh xuống (.mp4)",
+                    data=final_bytes,
+                    file_name="bds_video_hoan_thien.mp4",
+                    mime="video/mp4",
+                    use_container_width=True
+                )
+
+        except Exception as e:
+            st.error(f"❌ Đã xảy ra lỗi trong quá trình xử lý: {str(e)}")
+        finally:
+            # Dọn dẹp toàn bộ file tạm an toàn
+            for fpath in temp_files:
+                if os.path.exists(fpath):
+                    try:
+                        os.remove(fpath)
+                    except Exception:
+                        pass
+
+if __name__ == "__main__":
+    main()
