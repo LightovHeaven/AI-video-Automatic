@@ -15,7 +15,7 @@ from google.genai import types
 # 1. CẤU HÌNH TRANG & GIAO DIỆN LUXURY BRANDING (HẬU DÒNG TIỀN REAL ESTATE)
 # ==============================================================================
 st.set_page_config(
-    page_title="Hậu Dòng Tiền Real Estate | Auto Video Studio & Storytelling AI",
+    page_title="Hậu Dòng Tiền Real Estate | Multi-Video Studio & Storytelling AI",
     page_icon="🏢",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -74,7 +74,7 @@ CUSTOM_CSS = """
         gap: 8px;
     }
     
-    /* Badge DNA Style & Framework */
+    /* Badge DNA Style & Concat Info */
     .dna-box {
         background: rgba(212, 175, 55, 0.08);
         border: 1px dashed #D4AF37;
@@ -242,9 +242,6 @@ def generate_real_estate_script(api_key: str, content_type: str, framework_name:
                     return response.text.strip()
             except Exception as e:
                 last_error = e
-                err_msg = str(e)
-                
-                # Nếu chưa hết số lần thử của model hiện tại: Áp dụng Exponential Backoff (2s, 4s)
                 if attempt < max_retries - 1:
                     wait_seconds = 2 * (attempt + 1)
                     st.toast(
@@ -253,7 +250,6 @@ def generate_real_estate_script(api_key: str, content_type: str, framework_name:
                     )
                     time.sleep(wait_seconds)
                 else:
-                    # Nếu hết lượt thử của model hiện tại và còn model dự phòng: Chuyển Model
                     if model_idx < len(models_priority) - 1:
                         fallback_model = models_priority[model_idx + 1]
                         st.toast(
@@ -395,7 +391,67 @@ def transcribe_audio_to_srt(audio_path: str, output_srt_path: str, model_name: s
 
 
 # ==============================================================================
-# 7. TRẠM BIÊN TẬP & NUNG SUB THÔNG MINH (FFMPEG PIPELINE 9:16 & 16:9)
+# 7. TRẠM XỬ LÝ NHIỀU VIDEO THÔ & GHÉP NỐI THÔNG MINH (MULTI-VIDEO CONCAT)
+# ==============================================================================
+def prepare_concatenated_video(
+    raw_video_paths: list[str],
+    output_path: str,
+    target_w: int,
+    target_h: int
+) -> str:
+    """
+    Chuẩn hóa các video thô (resolution, fps=30, yuv420p, bỏ audio cũ)
+    và ghép nối (concat) tuần tự thành một video thống nhất.
+    """
+    if len(raw_video_paths) == 1:
+        return raw_video_paths[0]
+
+    temp_dir = Path(output_path).parent
+    normalized_clips = []
+
+    # 1. Chuẩn hóa từng clip về cùng độ phân giải và framerate 30fps
+    for idx, clip_path in enumerate(raw_video_paths):
+        norm_clip_path = str(temp_dir / f"norm_clip_{idx}.mp4")
+        cmd_norm = [
+            "ffmpeg", "-y",
+            "-i", clip_path,
+            "-vf", f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h},fps=30,format=yuv420p",
+            "-an",
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", "18",
+            norm_clip_path
+        ]
+        proc = subprocess.run(cmd_norm, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError(f"Lỗi chuẩn hóa video clip {idx + 1}:\n{proc.stderr}")
+        normalized_clips.append(norm_clip_path)
+
+    # 2. Tạo danh sách concat an toàn
+    concat_list_path = str(temp_dir / "concat_list.txt")
+    with open(concat_list_path, "w", encoding="utf-8") as f:
+        for norm_path in normalized_clips:
+            safe_clip_name = Path(norm_path).resolve().as_posix()
+            f.write(f"file '{safe_clip_name}'\n")
+
+    # 3. Ghép nối (Concat Demuxer)
+    cmd_concat = [
+        "ffmpeg", "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", concat_list_path,
+        "-c", "copy",
+        output_path
+    ]
+    proc = subprocess.run(cmd_concat, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"Lỗi ghép nối (concat) video thô:\n{proc.stderr}")
+
+    return output_path
+
+
+# ==============================================================================
+# 8. TRẠM BIÊN TẬP & NUNG SUB THÔNG MINH (FFMPEG PIPELINE 9:16 & 16:9)
 # ==============================================================================
 def render_final_video(
     raw_video_path: str,
@@ -436,7 +492,7 @@ def render_final_video(
     filter_complex_parts = []
     current_input_index = 0
 
-    # Input 0: Video gốc (loop tự động)
+    # Input 0: Video đã tổng hợp (loop tự động)
     inputs.extend(["-stream_loop", "-1", "-ss", str(trim_start), "-i", raw_video_path])
     video_input_idx = current_input_index
     current_input_index += 1
@@ -503,13 +559,13 @@ def render_final_video(
 
 
 # ==============================================================================
-# 8. GIAO DIỆN CHÍNH ỨNG DỤNG STREAMLIT
+# 9. GIAO DIỆN CHÍNH ỨNG DỤNG STREAMLIT
 # ==============================================================================
 def main():
     st.markdown("""
     <div class="brand-header">
-        <div class="brand-title">🏛️ HẬU DÒNG TIỀN REAL ESTATE • AUTO VIDEO STUDIO</div>
-        <div class="brand-subtitle">Trợ Lý Dựng Phim Tự Động • Tích Hợp 10 Storytelling Frameworks & Cơ Chế AI Chống Lỗi 503</div>
+        <div class="brand-title">🏛️ HẬU DÒNG TIỀN REAL ESTATE • MULTI-VIDEO STUDIO</div>
+        <div class="brand-subtitle">Trợ Lý Dựng Phim Tự Động • Ghép Nhiều Video Thô Thông Minh • 10 Storytelling Frameworks</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -627,7 +683,6 @@ def main():
         with btn_c2:
             gen_vision_btn = st.button("🔬 HỌC DNA & TẠO KỊCH BẢN", use_container_width=True)
 
-        # Xử lý tạo kịch bản theo Storytelling Framework (với Retry & Fallback)
         if gen_standard_btn:
             if not api_key:
                 st.error("⚠️ Vui lòng điền Gemini API Key để khởi chạy Trạm AI.")
@@ -641,7 +696,6 @@ def main():
                     except Exception as err:
                         st.error(str(err))
 
-        # Xử lý tạo kịch bản học phong cách video mẫu (với Retry & Fallback)
         if gen_vision_btn:
             if not api_key:
                 st.error("⚠️ Vui lòng điền Gemini API Key để chạy tính năng Vision.")
@@ -682,11 +736,11 @@ def main():
         st.markdown('</div>', unsafe_allow_html=True)
 
     # --------------------------------------------------------------------------
-    # CỘT PHẢI: TIMELINE STUDIO & DỰNG PHIM ĐA ĐỊNH DẠNG
+    # CỘT PHẢI: TIMELINE STUDIO & DỰNG PHIM ĐA VIDEO THÔ
     # --------------------------------------------------------------------------
     with col_right:
         st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        st.markdown('<div class="section-title">🎬 3. Timeline Studio: Nạp Tài Nguyên & Dựng Phim</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">🎬 3. Timeline Studio: Nạp Nhiều Video Thô & Hậu Kỳ</div>', unsafe_allow_html=True)
 
         aspect_ratio_selection = st.radio(
             "📐 Chọn định dạng khung hình xuất bản:",
@@ -700,7 +754,15 @@ def main():
         is_16_9 = "16:9" in aspect_ratio_selection
         ratio_tag = "16:9" if is_16_9 else "9:16"
 
-        uploaded_video = st.file_uploader("Tải lên Video thực tế thô (MP4/MOV):", type=["mp4", "mov", "m4v"])
+        # TÍNH NĂNG MỚI: TẢI LÊN NHIỀU FILE VIDEO THÔ CÙNG LÚC
+        uploaded_videos = st.file_uploader(
+            "Tải lên các video thực tế thô (Cho phép chọn nhiều file cùng lúc):",
+            type=["mp4", "mov", "m4v"],
+            accept_multiple_files=True
+        )
+        if uploaded_videos:
+            st.caption(f"📁 Đã chọn **{len(uploaded_videos)}** video clip thô. Hệ thống sẽ tự động scale, đồng bộ FPS và ghép nối theo thứ tự.")
+
         uploaded_logo = st.file_uploader("Logo thương hiệu 'Hậu Dòng Tiền' (File PNG trong suốt - Tùy chọn):", type=["png"])
 
         with st.expander("🛠️ Tùy Chỉnh Biên Tập & Phụ Đề Tự Động", expanded=True):
@@ -734,7 +796,7 @@ def main():
                 else:
                     st.error("⚠️ Bạn đang chọn Tải file ghi âm nhưng chưa nạp file âm thanh (.mp3/.wav).")
 
-            if not uploaded_video:
+            if not uploaded_videos:
                 st.error("⚠️ Vui lòng tải lên ít nhất 1 video quay thực tế tài sản.")
             elif has_voice:
                 progress_bar = st.progress(0)
@@ -742,11 +804,26 @@ def main():
 
                 with tempfile.TemporaryDirectory() as temp_dir:
                     try:
-                        # 1. Lưu file video thô và logo
-                        status_box.info("📥 [1/4] Đang tiếp nhận tài nguyên đầu vào...")
-                        temp_video_path = os.path.join(temp_dir, "raw_input.mp4")
-                        with open(temp_video_path, "wb") as f:
-                            f.write(uploaded_video.read())
+                        # 1. Lưu các file video thô và tiến hành Smart Concat
+                        status_box.info(f"📥 [1/4] Đang tiếp nhận và đồng bộ {len(uploaded_videos)} video clip thô...")
+                        raw_video_paths = []
+                        for idx, v_file in enumerate(uploaded_videos):
+                            clip_path = os.path.join(temp_dir, f"raw_clip_{idx}.mp4")
+                            with open(clip_path, "wb") as f:
+                                f.write(v_file.read())
+                            raw_video_paths.append(clip_path)
+
+                        target_w = 1920 if is_16_9 else 1080
+                        target_h = 1080 if is_16_9 else 1920
+                        combined_raw_path = os.path.join(temp_dir, "combined_master.mp4")
+
+                        # Ghép nối các video clip thành một video đồng nhất
+                        master_video_path = prepare_concatenated_video(
+                            raw_video_paths=raw_video_paths,
+                            output_path=combined_raw_path,
+                            target_w=target_w,
+                            target_h=target_h
+                        )
 
                         temp_logo_path = ""
                         if uploaded_logo:
@@ -791,7 +868,7 @@ def main():
                         status_box.info(f"⚡ [4/4] FFmpeg đang cắt thừa {trim_start_sec}s, Color Grade, dập Logo và nung Hardsub...")
                         final_output_path = os.path.join(temp_dir, "hau_dong_tien_final.mp4")
                         render_final_video(
-                            raw_video_path=temp_video_path,
+                            raw_video_path=master_video_path,
                             voice_audio_path=temp_voice_path,
                             srt_path=temp_srt_path,
                             logo_path=temp_logo_path,
@@ -800,35 +877,4 @@ def main():
                             output_path=final_output_path,
                             aspect_ratio=ratio_tag,
                             trim_start=trim_start_sec,
-                            font_size=font_size,
-                            margin_v=margin_vertical,
-                            enhance_color=enhance_color
-                        )
-                        progress_bar.progress(100)
-                        status_box.success(f"🎉 TUYỆT VỜI! Video BĐS Dòng Tiền định dạng {ratio_tag} đã xuất bản hoàn tất!")
-
-                        # Đọc video thành phẩm ra bộ nhớ
-                        with open(final_output_path, "rb") as f:
-                            video_bytes = f.read()
-
-                        st.markdown('<div class="section-card">', unsafe_allow_html=True)
-                        st.markdown(f'<div class="section-title">📺 Video Thành Phẩm Hoàn Thiện ({ratio_tag})</div>', unsafe_allow_html=True)
-                        st.video(video_bytes)
-
-                        download_filename = f"HauDongTien_{'YouTube_16x9' if is_16_9 else 'Shorts_9x16'}.mp4"
-                        st.download_button(
-                            label=f"⬇️ TẢI XUỐNG VIDEO ({download_filename})",
-                            data=video_bytes,
-                            file_name=download_filename,
-                            mime="video/mp4",
-                            use_container_width=True
-                        )
-                        st.markdown('</div>', unsafe_allow_html=True)
-
-                    except Exception as process_error:
-                        status_box.empty()
-                        st.error(f"❌ Xảy ra sự cố trong quá trình xử lý: {str(process_error)}")
-
-
-if __name__ == "__main__":
-    main()
+                            font_size=font
