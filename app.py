@@ -877,4 +877,35 @@ def main():
                             output_path=final_output_path,
                             aspect_ratio=ratio_tag,
                             trim_start=trim_start_sec,
-                            font_size=font
+                            font_size=font_size,
+                            margin_v=margin_vertical,
+                            enhance_color=enhance_color
+                        )
+                        progress_bar.progress(100)
+                        status_box.success(f"🎉 TUYỆT VỜI! Video BĐS Dòng Tiền định dạng {ratio_tag} đã xuất bản hoàn tất!")
+
+                        # Đọc video thành phẩm ra bộ nhớ
+                        with open(final_output_path, "rb") as f:
+                            video_bytes = f.read()
+
+                        st.markdown('<div class="section-card">', unsafe_allow_html=True)
+                        st.markdown(f'<div class="section-title">📺 Video Thành Phẩm Hoàn Thiện ({ratio_tag})</div>', unsafe_allow_html=True)
+                        st.video(video_bytes)
+
+                        download_filename = f"HauDongTien_{'YouTube_16x9' if is_16_9 else 'Shorts_9x16'}.mp4"
+                        st.download_button(
+                            label=f"⬇️ TẢI XUỐNG VIDEO ({download_filename})",
+                            data=video_bytes,
+                            file_name=download_filename,
+                            mime="video/mp4",
+                            use_container_width=True
+                        )
+                        st.markdown('</div>', unsafe_allow_html=True)
+
+                    except Exception as process_error:
+                        status_box.empty()
+                        st.error(f"❌ Xảy ra sự cố trong quá trình xử lý: {str(process_error)}")
+
+
+if __name__ == "__main__":
+    main()
